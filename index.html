@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reading Tracker</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:20px;max-width:900px}
+    input,button,select,textarea{font-size:1rem;padding:8px;margin:4px 0}
+    .row{display:flex;gap:8px;align-items:center}
+    .card{border:1px solid #ddd;padding:12px;border-radius:6px;margin:8px 0}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:6px;border-bottom:1px solid #eee;text-align:left}
+    small{color:#666}
+  </style>
+</head>
+<body>
+  <h1>Reading Tracker (Static)</h1>
+  <p>Masukkan URL lalu klik "Rekam". Bisa juga tempel teks artikel di <em>Manual text</em>.</p>
+
+  <div class="card">
+    <div class="row">
+      <input id="url" type="url" placeholder="https://..." style="flex:1" />
+      <button id="fetchBtn">Rekam</button>
+      <button id="clearBtn">Hapus semua</button>
+    </div>
+    <div>
+      <small>Jika fetch gagal karena CORS, gunakan tombol <em>Manual text</em> untuk menempelkan teks artikel.</small>
+    </div>
+    <div style="margin-top:8px">
+      <textarea id="manualText" rows="6" placeholder="Manual paste artikel (opsional)"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>Ringkasan</strong>
+    <div id="summary"></div>
+    <div style="margin-top:8px">
+      <button id="exportBtn">Export JSON</button>
+      <input id="importFile" type="file" accept=".json" />
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>Daftar Artikel</strong>
+    <table>
+      <thead><tr><th>Tanggal</th><th>Judul / URL</th><th>Kata</th><th>Kategori</th></tr></thead>
+      <tbody id="list"></tbody>
+    </table>
+  </div>
+
+<script>
+/* Minimal static reader + storage in localStorage.
+   Note: fetching external pages often dibatasi oleh CORS.
+   This script can use a public CORS-text proxy: https://r.jina.ai/http://{URL}
+   Use at your own risk (public service, tidak resmi). Jika gagal, gunakan Manual text.
+*/
+
+const DB_KEY = 'reading_tracker_v1';
+const fetchBtn = document.getElementById('fetchBtn');
+const clearBtn = document.getElementById('clearBtn');
+const exportBtn = document.getElementById('exportBtn');
+const importFile = document.getElementById('importFile');
+
+function loadDB(){ try { return JSON.parse(localStorage.getItem(DB_KEY) || '[]') } catch(e){ return [] } }
+function saveDB(items){ localStorage.setItem(DB_KEY, JSON.stringify(items)) }
+function todayISO(){ return new Date().toISOString().slice(0,10) }
+
+function countWords(text){
+  if(!text) return 0;
+  return (text.trim().replace(/\s+/g,' ').split(' ').filter(Boolean)).length;
+}
+
+function simpleCategory(text){
+  if(!text) return 'unknown';
+  const t = text.toLowerCase();
+  if(t.match(/\b(news|berita|breaking)\b/)) return 'news';
+  if(t.match(/\b(tutorial|how to|guide|cara)\b/)) return 'tutorial';
+  if(t.match(/\b(review|opinion|opini|commentary)\b/)) return 'opinion';
+  if(t.match(/\b(science|research|study|paper|journal|arxiv)\b/)) return 'research';
+  if(t.match(/\b(blog|personal|story)\b/)) return 'blog';
+  return 'general';
+}
+
+async function fetchArticleText(url){
+  // try direct fetch first (may fail due to CORS)
+  try {
+    const resp = await fetch(url);
+    if(resp.ok){
+      const html = await resp.text();
+      // naive extraction: use <article> if present, else body text
+      const m = html.match(/<article[\s\S]*?<\/article>/i);
+      const docText = m ? m[0].replace(/<[^>]+>/g,' ') : html.replace(/<[^>]+>/g,' ');
+      return docText;
+    }
+  } catch(e){ /* ignore */ }
+
+  // Fallback: use public text-extraction proxy (r.jina.ai)
+  try {
+    const proxy = 'https://r.jina.ai/http://';
+    const resp2 = await fetch(proxy + url.replace(/^https?:\/\//,''));
+    if(resp2.ok){
+      const txt = await resp2.text();
+      return txt;
+    }
+  } catch(e){ /* ignore */ }
+
+  return null;
+}
+
+function updateUI(){
+  const items = loadDB().sort((a,b)=> b.read_at.localeCompare(a.read_at));
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  let totalToday = 0, totalWordsToday = 0, totalAll=0;
+  const byDate = {};
+  items.forEach(it=>{
+    totalAll += it.word_count||0;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${it.read_at.slice(0,10)}</td>
+                    <td><a href="${it.url||'#'}" target="_blank" rel="noopener">${it.title||it.url||'(no title)'}</a></td>
+                    <td>${it.word_count||0}</td>
+                    <td>${it.category||''}</td>`;
+    list.appendChild(tr);
+    const d = it.read_at.slice(0,10);
+    byDate[d] = byDate[d] || {count:0, words:0};
+    byDate[d].count += 1;
+    byDate[d].words += it.word_count||0;
+    if(d === todayISO()){ totalToday += 1; totalWordsToday += it.word_count||0 }
+  });
+  const summary = document.getElementById('summary');
+  summary.innerHTML = `<div>Hari ini: ${totalToday} bacaan — ${totalWordsToday} kata</div>
+                       <div>Total: ${items.length} bacaan — ${totalAll} kata</div>`;
+}
+
+fetchBtn.addEventListener('click', async ()=>{
+  const url = document.getElementById('url').value.trim();
+  const manual = document.getElementById('manualText').value.trim();
+  if(!url && !manual){ alert('Masukkan URL atau tempel teks di Manual text.'); return; }
+
+  let text = manual || null;
+  let title = '';
+  if(!text && url){
+    fetchBtn.disabled = true; fetchBtn.textContent = 'Memproses...';
+    const fetched = await fetchArticleText(url);
+    fetchBtn.disabled = false; fetchBtn.textContent = 'Rekam';
+    if(!fetched){ alert('Gagal mengambil artikel (CORS atau jaringan). Gunakan Manual text.'); return; }
+    text = fetched;
+    // naive title extraction from HTML (for proxy response, may be plain text)
+    const tmatch = fetched.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if(tmatch) title = tmatch[1].trim();
+  }
+
+  // if manual text, optionally set title from URL field or first line
+  if(!title){
+    title = url || (text.split('\n').find(l=>l.trim().length>0) || 'Untitled').slice(0,120);
+  }
+
+  const words = countWords(text);
+  const category = simpleCategory(text);
+  const item = {
+    id: Date.now().toString(36),
+    url: url || '',
+    title: title,
+    word_count: words,
+    category: category,
+    excerpt: text.slice(0,500),
+    read_at: new Date().toISOString()
+  };
+  const db = loadDB();
+  db.push(item);
+  saveDB(db);
+  document.getElementById('url').value = '';
+  document.getElementById('manualText').value = '';
+  updateUI();
+});
+
+clearBtn.addEventListener('click', ()=>{
+  if(!confirm('Hapus semua data di browser?')) return;
+  localStorage.removeItem(DB_KEY);
+  updateUI();
+});
+
+exportBtn.addEventListener('click', ()=>{
+  const data = JSON.stringify(loadDB(),null,2);
+  const blob = new Blob([data],{type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'reading_export.json'; a.click();
+  URL.revokeObjectURL(url);
+});
+
+importFile.addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = ()=> {
+    try {
+      const j = JSON.parse(reader.result);
+      if(!Array.isArray(j)) throw new Error('Invalid format');
+      saveDB(j);
+      updateUI();
+      alert('Import sukses');
+    } catch(err){ alert('Import gagal: ' + err.message) }
+  };
+  reader.readAsText(file);
+});
+
+updateUI();
+</script>
+</body>
+</html>
